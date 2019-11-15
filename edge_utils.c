@@ -171,10 +171,6 @@ n2n_edge_t* edge_init(const tuntap_dev *dev, const n2n_edge_conf_t *conf, int *r
   memcpy(&eee->device, dev, sizeof(*dev));
   eee->start_time = time(NULL);
 
-  /* REVISIT: BbMaj7 : Should choose something with less predictability
-           * particularly for embedded targets with no real-time clock. */
-  srand(eee->start_time);
-
   eee->known_peers    = NULL;
   eee->pending_peers  = NULL;
   eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;
@@ -388,9 +384,43 @@ static void register_with_new_peer(n2n_edge_t * eee,
 	       HASH_COUNT(eee->pending_peers));
 
     /* trace Sending REGISTER */
-    send_register(eee, &(scan->sock), mac);
     if(from_supernode) {
+	  /* UDP NAT hole punching through supernode. Send to peer first(punch local UDP hole)
+       * and then ask supernode to forward. Supernode then ask peer to ack. Some nat device
+       * drop and block ports with incoming UDP packet if out-come traffic does not exist.
+       * So we can alternatively set TTL so that the packet sent to peer never really reaches
+       * The register_ttl is basically nat level + 1. Set it to 1 means host like DMZ.
+       */
+      if (eee->conf.register_ttl == 1) {
+        /* We are DMZ host or port is directly accessible. Just let peer to send back the ack */
+#ifndef WIN32
+      } else if(eee->conf.register_ttl > 1) {
+        /* Setting register_ttl usually implies that the edge knows the internal net topology
+         * clearly, we can apply aggressive port prediction to support incoming Symmetric NAT
+         */
+        int curTTL = 0;
+        socklen_t lenTTL = sizeof(int);
+        n2n_sock_t sock = scan->sock;
+        int alter = 16; /* TODO: set by command line or more reliable prediction method */
+
+        getsockopt(eee->udp_sock, IPPROTO_IP, IP_TTL, (void *)(char *)&curTTL, &lenTTL);
+        setsockopt(eee->udp_sock, IPPROTO_IP, IP_TTL,
+                  (void *)(char *)&eee->conf.register_ttl,
+                  sizeof(eee->conf.register_ttl));
+        for (; alter > 0; alter--, sock.port++)
+        {
+          send_register(eee, &sock, mac);
+        }
+        setsockopt(eee->udp_sock, IPPROTO_IP, IP_TTL, (void *)(char *)&curTTL, sizeof(curTTL));
+#endif
+      } else { /* eee->conf.register_ttl <= 0 */
+        /* Normal STUN */
+        send_register(eee, &(scan->sock), mac);
+      }
       send_register(eee, &(eee->supernode), mac);
+    } else {
+      /* P2P register, send directly */
+      send_register(eee, &(scan->sock), mac);
     }
 
     register_with_local_peers(eee);
@@ -1465,6 +1495,16 @@ static void readFromIPSocket(n2n_edge_t * eee, int in_sock) {
 	  if(is_valid_peer_sock(&pkt.sock))
 	    orig_sender = &(pkt.sock);
 
+	  if(!from_supernode) {
+	    /* This is a P2P packet from the peer. We purge a pending
+	     * registration towards the possibly nat-ted peer address as we now have
+	     * a valid channel. We still use check_peer_registration_needed in
+	     * handle_PACKET to double check this.
+	     */
+	    traceEvent(TRACE_DEBUG, "Got P2P packet");
+	    find_and_remove_peer(&eee->pending_peers, pkt.srcMac);
+	  }
+
 	  traceEvent(TRACE_INFO, "Rx PACKET from %s (sender=%s) [%u B]",
 		     sock_to_cstr(sockbuf1, &sender),
 		     sock_to_cstr(sockbuf2, orig_sender),
@@ -1799,6 +1839,8 @@ void edge_term(n2n_edge_t * eee) {
 /* ************************************** */
 
 static int edge_init_sockets(n2n_edge_t *eee, int udp_local_port, int mgmt_port, uint8_t tos) {
+  int sockopt;
+
   if(udp_local_port > 0)
     traceEvent(TRACE_NORMAL, "Binding to local port %d", udp_local_port);
 
@@ -1808,10 +1850,9 @@ static int edge_init_sockets(n2n_edge_t *eee, int udp_local_port, int mgmt_port,
     return(-1);
   }
 
-#ifdef __linux__
   if(tos) {
     /* https://www.tucny.com/Home/dscp-tos */
-    int sockopt = tos;
+    sockopt = tos;
 
     if(setsockopt(eee->udp_sock, IPPROTO_IP, IP_TOS, &sockopt, sizeof(sockopt)) == 0)
       traceEvent(TRACE_NORMAL, "TOS set to 0x%x", tos);
@@ -1819,14 +1860,14 @@ static int edge_init_sockets(n2n_edge_t *eee, int udp_local_port, int mgmt_port,
       traceEvent(TRACE_ERROR, "Could not set TOS 0x%x[%d]: %s", tos, errno, strerror(errno));
   }
 
-  if(eee->conf.disable_pmtu_discovery) {
-    int sockopt = 0;
+#ifdef IP_PMTUDISC_DO
+  sockopt = (eee->conf.disable_pmtu_discovery) ? IP_PMTUDISC_DONT : IP_PMTUDISC_DO;
 
-    if(setsockopt(eee->udp_sock, IPPROTO_IP, IP_MTU_DISCOVER, &sockopt, sizeof(sockopt)) < 0)
-      traceEvent(TRACE_WARNING, "Could not disable PMTU discovery[%d]: %s", errno, strerror(errno));
-    else
-      traceEvent(TRACE_DEBUG, "PMTU discovery disabled");
-  }
+  if(setsockopt(eee->udp_sock, IPPROTO_IP, IP_MTU_DISCOVER, &sockopt, sizeof(sockopt)) < 0)
+    traceEvent(TRACE_WARNING, "Could not %s PMTU discovery[%d]: %s",
+      (eee->conf.disable_pmtu_discovery) ? "disable" : "enable", errno, strerror(errno));
+  else
+    traceEvent(TRACE_DEBUG, "PMTU discovery %s", (eee->conf.disable_pmtu_discovery) ? "disabled" : "enabled");
 #endif
 
   eee->udp_mgmt_sock = open_socket(mgmt_port, 0 /* bind LOOPBACK */);

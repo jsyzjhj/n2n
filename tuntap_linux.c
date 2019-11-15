@@ -21,50 +21,26 @@
 #ifdef __linux__
 
 #include <net/if_arp.h>
-
-/* *************************************************** */
-
-static void read_mac(char *ifname, n2n_mac_t mac_addr) {
-  int _sock, res;
-  struct ifreq ifr;
-  macstr_t mac_addr_buf;
-
-  memset (&ifr,0,sizeof(struct ifreq));
-
-  /* Dummy socket, just to make ioctls with */
-  _sock=socket(PF_INET, SOCK_DGRAM, 0);
-  strcpy(ifr.ifr_name, ifname);
-  res = ioctl(_sock,SIOCGIFHWADDR,&ifr);
-  
-  if(res < 0) {
-    perror ("Get hw addr");
-    traceEvent(TRACE_ERROR, "Unable to read interfce %s MAC", ifname);
-  } else
-    memcpy(mac_addr, ifr.ifr_ifru.ifru_hwaddr.sa_data, 6);
-
-  traceEvent(TRACE_NORMAL, "Interface %s has MAC %s",
-	     ifname,
-	     macaddr_str(mac_addr_buf, mac_addr ));
-  close(_sock);
-}
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 
 /* ********************************** */
 
 static int setup_ifname(int fd, const char *ifname, const char *ipaddr,
-          const char *netmask, const char *mac, int mtu) {
+          const char *netmask, uint8_t *mac, int mtu) {
   struct ifreq ifr;
+
+  memset(&ifr, 0, sizeof(ifr));
 
   strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
   ifr.ifr_name[IFNAMSIZ-1] = '\0';
 
-  if(mac && mac[0]) {
-    str2mac((uint8_t *)ifr.ifr_hwaddr.sa_data, mac);
-    ifr.ifr_hwaddr.sa_family = ARPHRD_ETHER;
+  ifr.ifr_hwaddr.sa_family = ARPHRD_ETHER;
+  memcpy(ifr.ifr_hwaddr.sa_data, mac, 6);
 
-    if(ioctl(fd, SIOCSIFHWADDR, &ifr) == -1) {
-      traceEvent(TRACE_ERROR, "ioctl(SIOCSIFHWADDR) failed [%d]: %s", errno, strerror(errno));
-      return(-1);
-    }
+  if(ioctl(fd, SIOCSIFHWADDR, &ifr) == -1) {
+    traceEvent(TRACE_ERROR, "ioctl(SIOCSIFHWADDR) failed [%d]: %s", errno, strerror(errno));
+    return(-1);
   }
 
   ifr.ifr_addr.sa_family = AF_INET;
@@ -136,6 +112,12 @@ int tuntap_open(tuntap_dev *device,
   int ioctl_fd;
   struct ifreq ifr;
   int rc;
+  int nl_fd;
+  char nl_buf[8192]; /* >= 8192 to avoid truncation, see "man 7 netlink" */
+  struct iovec iov;
+  struct sockaddr_nl sa;
+  int up_and_running = 0;
+  struct msghdr msg;
 
   device->fd = open(tuntap_device, O_RDWR);
   if(device->fd < 0) {
@@ -158,12 +140,55 @@ int tuntap_open(tuntap_dev *device,
   /* Store the device name for later reuse */
   strncpy(device->dev_name, ifr.ifr_name, MIN(IFNAMSIZ, N2N_IFNAMSIZ) );
 
-  if((ioctl_fd = socket(PF_INET, SOCK_DGRAM, IPPROTO_IP)) < 0) {
-    traceEvent(TRACE_ERROR, "socket creation failed [%d]: %s", errno, strerror(errno));
+  if(device_mac && device_mac[0]) {
+    /* Use the user-provided MAC */
+    str2mac(device->mac_addr, device_mac);
+  } else {
+    /* Set an explicit random MAC to know the exact MAC in use. Manually
+     * reading the MAC address is not safe as it may change internally
+     * also after the TAP interface UP status has been notified. */
+    int i;
+
+    for(i = 0; i < 6; i++)
+      device->mac_addr[i] = rand();
+
+    device->mac_addr[0] &= ~0x01; /* Clear multicast bit */
+    device->mac_addr[0] |= 0x02;  /* Set locally-assigned bit */
+  }
+
+  /* Initialize Netlink socket */
+  if((nl_fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE)) == -1) {
+    traceEvent(TRACE_ERROR, "netlink socket creation failed [%d]: %s", errno, strerror(errno));
     return -1;
   }
 
-  if(setup_ifname(ioctl_fd, device->dev_name, device_ip, device_mask, device_mac, mtu) < 0) {
+  iov.iov_base = nl_buf;
+  iov.iov_len = sizeof(nl_buf);
+
+  memset(&sa, 0, sizeof(sa));
+  sa.nl_family = PF_NETLINK;
+  sa.nl_groups = RTMGRP_LINK;
+  sa.nl_pid = getpid();
+
+  msg.msg_name = &sa;
+  msg.msg_namelen = sizeof(sa);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+
+  /* Subscribe to interface events */
+  if(bind(nl_fd, (struct sockaddr*)&sa, sizeof(sa)) == -1) {
+    traceEvent(TRACE_ERROR, "netlink socket bind failed [%d]: %s", errno, strerror(errno));
+    return -1;
+  }
+
+  if((ioctl_fd = socket(PF_INET, SOCK_DGRAM, IPPROTO_IP)) < 0) {
+    traceEvent(TRACE_ERROR, "socket creation failed [%d]: %s", errno, strerror(errno));
+    close(nl_fd);
+    return -1;
+  }
+
+  if(setup_ifname(ioctl_fd, device->dev_name, device_ip, device_mask, device->mac_addr, mtu) < 0) {
+    close(nl_fd);
     close(ioctl_fd);
     close(device->fd);
     return -1;
@@ -171,9 +196,39 @@ int tuntap_open(tuntap_dev *device,
 
   close(ioctl_fd);
 
+  /* Wait for the up and running notification */
+  traceEvent(TRACE_INFO, "Waiting for TAP interface to be up and running...");
+
+  while(!up_and_running) {
+    ssize_t len = recvmsg(nl_fd, &msg, 0);
+    struct nlmsghdr *nh;
+
+    for(nh = (struct nlmsghdr *)nl_buf; NLMSG_OK(nh, len); nh = NLMSG_NEXT(nh, len)) {
+      if(nh->nlmsg_type == NLMSG_ERROR) {
+        traceEvent(TRACE_DEBUG, "nh->nlmsg_type == NLMSG_ERROR");
+        break;
+      }
+
+      if(nh->nlmsg_type == NLMSG_DONE)
+        break;
+
+      if(nh->nlmsg_type == NETLINK_GENERIC) {
+        struct ifinfomsg *ifi = NLMSG_DATA(nh);
+
+        /* NOTE: skipping interface name check, assuming it's our TAP */
+        if((ifi->ifi_flags & IFF_UP) && (ifi->ifi_flags & IFF_RUNNING)) {
+          up_and_running = 1;
+          traceEvent(TRACE_INFO, "Interface is up and running");
+          break;
+        }
+      }
+    }
+  }
+
+  close(nl_fd);
+
   device->ip_addr = inet_addr(device_ip);
   device->device_mask = inet_addr(device_mask);
-  read_mac(dev, device->mac_addr);
   return(device->fd);
 }
 
